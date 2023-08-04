@@ -25,9 +25,11 @@ import functools
 import importlib
 import time
 import types
-from typing import Any, Callable, Iterator, Optional, Tuple
+from typing import Any, Callable, Iterator, Optional, Tuple, Union
 
 Callback = Callable[..., None]
+
+ClassOrFunction = Union[type[Any], Callable[..., Any]]
 
 
 @dataclasses.dataclass
@@ -36,6 +38,7 @@ class LazyModule:
 
   module_name: str
   module: Optional[types.ModuleType] = None
+  class_or_function: Optional[ClassOrFunction] = None
   fromlist: Optional[Tuple[str, ...]] = ()
   error_callback: Optional[Callback] = None
   success_callback: Optional[Callback] = None
@@ -54,9 +57,76 @@ class LazyModule:
     Returns:
       New object
     """
-    return cls(**kwargs)
+    return LazyModule(**kwargs)
+
+  def _import_class_or_function(self, module_name: str) -> ClassOrFunction:
+    """Imports when `module_name` is known to be a class or a function."""
+    if "." not in module_name:
+      raise ValueError("Cannot import a function that is not in a module.")
+    # If the import is "from x.y import some_function", then we have:
+    # * module_name = "x.y"
+    # * function_name = "some_function"
+    function_name = module_name.split(".")[-1]
+    module_name = ".".join(module_name.split(".")[:-1])
+    module = self._import_module(module_name)
+    return getattr(module, function_name)
+
+  def _import_module(self, module_name: str) -> types.ModuleType:
+    """Imports module name when `module_name` is known to be a module."""
+    try:
+      start_import_time = time.perf_counter()
+      module = importlib.import_module(module_name)
+      import_time_ms = (time.perf_counter() - start_import_time) * 1000
+      if self.success_callback is not None:
+        self.success_callback(
+            import_time_ms=import_time_ms,
+            module=module,
+            module_name=module_name,
+        )
+      return module
+    except ImportError as exception:
+      if self.error_callback is not None:
+        self.error_callback(exception=exception, module_name=module_name)
+      raise exception
+
+  def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    """Overwrites __call__ if the LazyModule is a class or a function."""
+    if self.class_or_function is None:  # Load on first call
+      self.class_or_function = self._import_class_or_function(self.module_name)
+    return self.class_or_function(*args, **kwargs)
+
+  def __instancecheck__(self, instance):
+    """Overwrites instance check for lazily-loaded classes."""
+    if self.class_or_function is None:  # Load on first call
+      self.class_or_function = self._import_class_or_function(self.module_name)
+    return isinstance(instance, self.class_or_function)
+
+  def __mro_entries__(self, bases):
+    """Overwrites MRO entries for lazily-loaded classes.
+
+    This is needed to not inherit from LazyModule.
+
+    Args:
+      bases: bases parameter of
+        https://docs.python.org/3/reference/datamodel.html#resolving-mro-entries.
+
+    Returns:
+      The actual base class to inherit from.
+    """
+    if self.class_or_function is None:  # Load on first call
+      self.class_or_function = self._import_class_or_function(self.module_name)
+    return (self.class_or_function,)
 
   def __getattr__(self, name: str) -> Any:
+    """Overwrites x.y if the LazyModule is a module."""
+    # Dunder methods start and end with two underscores:
+    is_dunder_method = name.startswith("__") and name.endswith("__")
+    if is_dunder_method or self.class_or_function is not None:
+      if self.class_or_function is None:  # Load on first call
+        self.class_or_function = self._import_class_or_function(
+            self.module_name
+        )
+      return getattr(self.class_or_function, name)
     if name in self.fromlist:
       module_name = f"{self.module_name}.{name}"
       return self.from_cache(
@@ -67,20 +137,7 @@ class LazyModule:
           success_callback=self.success_callback,
       )
     if self.module is None:  # Load on first call
-      try:
-        start_import_time = time.perf_counter()
-        self.module = importlib.import_module(self.module_name)
-        import_time_ms = (time.perf_counter() - start_import_time) * 1000
-        if self.success_callback is not None:
-          self.success_callback(
-              import_time_ms=import_time_ms,
-              module=self.module,
-              module_name=self.module_name,
-          )
-      except ImportError as exception:
-        if self.error_callback is not None:
-          self.error_callback(exception=exception, module_name=self.module_name)
-        raise exception
+      self.module = self._import_module(self.module_name)
     return getattr(self.module, name)
 
 
@@ -96,9 +153,13 @@ def lazy_imports(
 
   Warning: mind current implementation's limitations:
 
-  - You can only lazy load modules (`from x import y` will not work if `y` is a
-    constant or a function or a class).
+  - You cannot lazy load constants (`from x import y` will not work if `y` is a
+    constant). You can only lazy load modules, functions and classes.
   - You cannot `import x.y` if `y` is not imported in the `x/__init__.py`.
+  - `lazy_imports` was tested in the context of TFDS. Edge cases that do not
+    appear in TFDS codebase may not be covered. Notably, we may not have
+    implemented all dunder method in LazyMethod, but only those required for
+    TFDS usage for now.
 
   Usage:
 
@@ -116,8 +177,8 @@ def lazy_imports(
       module.
     success_callback: a callback to trigger when an import succeeds. The
       callback is passed kwargs containing: 1) import_time_ms (float): the
-      import time (in milliseconds); 2) module (Any): the imported module; 3)
-      module_name (str): the name of the imported module.
+      import time (in milliseconds); 2) module (ModuleType): the imported
+      module; 3) module_name (str): the name of the imported module.
 
   Yields:
     None
